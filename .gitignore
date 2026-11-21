@@ -1,10 +1,18 @@
 # Maven build output
+HELP.md
 target/
 
 # IDE files
 .idea/
 *.iml
 .vscode/
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache/
 
 # Local secrets and logs
 .env
