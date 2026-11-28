@@ -1,5 +1,5 @@
 -- 01_schema.sql - first StreamFlix schema for MariaDB 10.11 or newer.
--- This script follows the reviewed ERD: 28 tables and 40 foreign keys.
+-- This script follows the reviewed ERD: 30 tables and 46 foreign keys.
 -- Run it once in an empty database using a setup/admin account.
 -- It does not drop tables or change an existing schema.
 --
@@ -95,7 +95,7 @@ CREATE TABLE account (
         CHAR_LENGTH(password_hash) > 0
     ),
     CONSTRAINT ck_account_status CHECK (
-        status IN ('pending', 'active', 'suspended')
+        status IN ('pending', 'active', 'payment_blocked', 'deactivated')
     ),
     CONSTRAINT ck_account_role CHECK (
         application_role IN ('user', 'content_manager')
@@ -135,6 +135,30 @@ CREATE TABLE verification_token (
     )
 ) ENGINE=InnoDB;
 
+-- access_token: One login token belongs to one account.
+-- The API saves only the token hash. Logging out sets revoked_at.
+CREATE TABLE access_token (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    account_id INT NOT NULL,
+    token_hash CHAR(64) NOT NULL,
+    issued_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
+    revoked_at DATETIME NULL,
+    CONSTRAINT uq_access_token_1 UNIQUE (token_hash),
+    CONSTRAINT fk_access_token_account_id
+        FOREIGN KEY (account_id) REFERENCES account(id),
+    CONSTRAINT ck_access_token_hash CHECK (
+        CHAR_LENGTH(TRIM(token_hash)) = 64
+    ),
+    -- A login token is valid for 8 hours from when it was issued.
+    CONSTRAINT ck_access_token_expiry CHECK (
+        expires_at = issued_at + INTERVAL 8 HOUR
+    ),
+    CONSTRAINT ck_access_token_revoked_at CHECK (
+        revoked_at IS NULL OR revoked_at >= issued_at
+    )
+) ENGINE=InnoDB;
+
 -- profile: Profile identity and age category only.
 CREATE TABLE profile (
     id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -157,25 +181,20 @@ CREATE TABLE preference (
     id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     profile_id INT NOT NULL,
     preferred_title_type VARCHAR(10) NOT NULL DEFAULT 'all',
-    minimum_title_age INT NULL,
-    maximum_title_age INT NULL,
+    minimum_age_classification_id INT NULL,
+    maximum_age_classification_id INT NULL,
     CONSTRAINT uq_preference_1 UNIQUE (profile_id),
     CONSTRAINT fk_preference_profile_id
         FOREIGN KEY (profile_id) REFERENCES profile(id),
+    CONSTRAINT fk_preference_minimum_age_classification_id
+        FOREIGN KEY (minimum_age_classification_id) REFERENCES age_classification(id),
+    CONSTRAINT fk_preference_maximum_age_classification_id
+        FOREIGN KEY (maximum_age_classification_id) REFERENCES age_classification(id),
     CONSTRAINT ck_preference_title_type CHECK (
         preferred_title_type IN ('all', 'film', 'series')
-    ),
-    CONSTRAINT ck_preference_minimum_age CHECK (
-        minimum_title_age IS NULL OR minimum_title_age >= 0
-    ),
-    CONSTRAINT ck_preference_maximum_age CHECK (
-        maximum_title_age IS NULL OR maximum_title_age >= 0
-    ),
-    CONSTRAINT ck_preference_age_range CHECK (
-        minimum_title_age IS NULL
-        OR maximum_title_age IS NULL
-        OR minimum_title_age <= maximum_title_age
     )
+    -- Age filters may be empty. The procedure must compare the minimum_age
+    -- values in age_classification, not the IDs, and respect the profile age.
 ) ENGINE=InnoDB;
 
 -- preference_genre: One selection per preference and genre.
@@ -271,6 +290,7 @@ CREATE TABLE episode (
     age_classification_id INT NOT NULL,
     episode_number INT NOT NULL,
     name VARCHAR(200) NOT NULL,
+    description TEXT NOT NULL,
     duration_seconds INT NOT NULL,
     is_available BOOLEAN NOT NULL DEFAULT TRUE,
     CONSTRAINT uq_episode_1 UNIQUE (season_id, episode_number),
@@ -388,6 +408,7 @@ CREATE TABLE viewing_session (
     profile_id INT NOT NULL,
     film_id INT NULL,
     episode_id INT NULL,
+    quality_id INT NOT NULL,
     started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     watched_seconds INT NOT NULL DEFAULT 0,
     last_position_seconds INT NOT NULL DEFAULT 0,
@@ -399,6 +420,8 @@ CREATE TABLE viewing_session (
         FOREIGN KEY (film_id) REFERENCES film(id),
     CONSTRAINT fk_viewing_session_episode_id
         FOREIGN KEY (episode_id) REFERENCES episode(id),
+    CONSTRAINT fk_viewing_session_quality_id
+        FOREIGN KEY (quality_id) REFERENCES quality(id),
     -- A session is for one film OR one episode, never both.
     CONSTRAINT ck_viewing_session_target CHECK (
         (film_id IS NOT NULL AND episode_id IS NULL)
@@ -465,12 +488,21 @@ CREATE TABLE subscription (
     subscription_type_id INT NOT NULL,
     started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME NULL,
+    -- This helper is filled in by MariaDB, not by the API.
+    -- An open subscription gets its account_id; a closed one gets NULL.
+    -- UNIQUE then allows only one open subscription for each account.
+    -- Many closed subscriptions are allowed because UNIQUE allows many NULLs.
+    -- VIRTUAL means the value is calculated, not stored as another fact.
+    open_account_id INT GENERATED ALWAYS AS (
+        CASE WHEN ended_at IS NULL THEN account_id ELSE NULL END
+    ) VIRTUAL,
+    CONSTRAINT uq_subscription_open_account UNIQUE (open_account_id),
     CONSTRAINT fk_subscription_account_id
         FOREIGN KEY (account_id) REFERENCES account(id),
     CONSTRAINT fk_subscription_subscription_type_id
         FOREIGN KEY (subscription_type_id) REFERENCES subscription_type(id),
     CONSTRAINT ck_subscription_period CHECK (
-        ended_at IS NULL OR ended_at > started_at
+        ended_at IS NULL OR ended_at >= started_at
     )
 ) ENGINE=InnoDB;
 
@@ -505,16 +537,13 @@ CREATE TABLE payment (
     )
 ) ENGINE=InnoDB;
 
--- invitation: One invitation links two accounts and one shared discount award.
+-- invitation: Links the account that invited someone to the account that accepted.
 CREATE TABLE invitation (
     id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     inviter_account_id INT NOT NULL,
     invitee_account_id INT NULL,
     token_hash CHAR(64) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    discount_starts_at DATETIME NULL,
-    discount_ends_at DATETIME NULL,
-    monthly_discount_amount DECIMAL(10,2) NULL,
     CONSTRAINT uq_invitation_1 UNIQUE (token_hash),
     CONSTRAINT uq_invitation_2 UNIQUE (invitee_account_id),
     CONSTRAINT fk_invitation_inviter_account_id
@@ -525,7 +554,7 @@ CREATE TABLE invitation (
         CHAR_LENGTH(TRIM(token_hash)) = 64
     ),
     CONSTRAINT ck_invitation_status CHECK (
-        status IN ('pending', 'accepted', 'rewarded', 'expired', 'rejected')
+        status IN ('pending', 'accepted', 'rewarded', 'expired', 'revoked')
     ),
     CONSTRAINT ck_invitation_different_accounts CHECK (
         invitee_account_id IS NULL OR invitee_account_id <> inviter_account_id
@@ -535,25 +564,30 @@ CREATE TABLE invitation (
     ),
     CONSTRAINT ck_invitation_pending CHECK (
         status <> 'pending' OR invitee_account_id IS NULL
-    ),
-    -- The three discount fields must be either all empty or all filled in.
-    CONSTRAINT ck_invitation_discount_fields CHECK (
-        (discount_starts_at IS NULL
-            AND discount_ends_at IS NULL
-            AND monthly_discount_amount IS NULL)
-        OR (discount_starts_at IS NOT NULL
-            AND discount_ends_at IS NOT NULL
-            AND monthly_discount_amount IS NOT NULL)
-    ),
-    CONSTRAINT ck_invitation_discount_status CHECK (
-        (status = 'rewarded' AND discount_starts_at IS NOT NULL)
-        OR (status <> 'rewarded' AND discount_starts_at IS NULL)
-    ),
+    )
+) ENGINE=InnoDB;
+
+-- invitation_discount: One discount record belongs to one account.
+-- The procedure adds one row for each account in the same transaction.
+-- Both receive EUR 2.00 per month for 3 months.
+CREATE TABLE invitation_discount (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    invitation_id INT NOT NULL,
+    account_id INT NOT NULL,
+    starts_at DATETIME NOT NULL,
+    ends_at DATETIME NOT NULL,
+    monthly_amount DECIMAL(10,2) NOT NULL,
+    -- Each account can receive an invitation discount only once.
+    CONSTRAINT uq_invitation_discount_1 UNIQUE (account_id),
+    CONSTRAINT fk_invitation_discount_invitation_id
+        FOREIGN KEY (invitation_id) REFERENCES invitation(id),
+    CONSTRAINT fk_invitation_discount_account_id
+        FOREIGN KEY (account_id) REFERENCES account(id),
     CONSTRAINT ck_invitation_discount_period CHECK (
-        discount_starts_at IS NULL OR discount_ends_at > discount_starts_at
+        ends_at > starts_at
     ),
     CONSTRAINT ck_invitation_discount_amount CHECK (
-        monthly_discount_amount IS NULL OR monthly_discount_amount > 0
+        monthly_amount > 0
     )
 ) ENGINE=InnoDB;
 
@@ -562,11 +596,17 @@ CREATE TABLE invitation (
 -- 1. Each title must have exactly one film OR series subtype.
 --    Separate UNIQUE(title_id) keys do not enforce that across two tables.
 -- 2. Paid subscription periods for one account must not overlap.
+--    UNIQUE(open_account_id) already prevents two open periods, but it
+--    does not prevent overlapping periods that have an end date.
 -- 3. Age restrictions, quality limits and resume positions need checks
 --    against other rows. They cannot be enforced by these row CHECKs alone.
+--    Compare preference age_classification.minimum_age values, not their IDs.
 -- 4. Remove completed titles from watch_list using the required trigger.
--- 5. Activate both invitation discounts in one transaction, checking that
---    neither account has received a discount before in EITHER account role.
+-- 5. Activate both invitation discounts in one transaction. Check that
+--    each recipient is one of the invitation's two accounts, set the same
+--    3-month period and EUR 2.00 amount for both, and mark it rewarded.
+--    UNIQUE(account_id) prevents an account receiving another discount.
+--    Revoke an invitation only while it is pending.
 -- 6. Activate the seven-day trial and apply login/payment blocking policies.
 -- 7. Create employee/API views, roles and controlled write procedures.
 --    api_user_account must not receive direct access to these tables.
